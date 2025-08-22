@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
-find_hosts.py — Locate Windows 'hosts' files.
+#   What it does
+#   Fast check of the standard Windows path:
+#   C:\Windows\System32\drivers\etc\hosts (plus Sysnative for 32-bit Python on 64-bit Windows).
+#   Optional deep scan across all fixed drives (and optionally network/removable) for any file named hosts.
+#   Depth limiting (--max-depth) to keep scans fast.
+#   Stop on first match with --first.
+#   Prints each match with file size and last-modified timestamp.
+#   find_hosts.py — Locate Windows 'hosts' files.
 
 Usage examples:
   # Fast: check the standard locations only
