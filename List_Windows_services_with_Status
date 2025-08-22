@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""
+services_list.py — List Windows services (name, display name, status, start type).
+#    Remote: --computer SERVER01 uses PowerShell’s Get-Service -ComputerName when available; otherwise it falls back to sc \\SERVER01 query state= all. 
+#    You’ll need permissions and firewall/RPC open.
+#    Filter: --filter "sql*" (matches both Name and DisplayName).
+#    Formats: --format table|json|csv.
+Examples:
+  # Local machine (table)
+  python services_list.py
+
+  # Remote machine by name or IP
+  python services_list.py --computer SERVER01
+
+  # Filter by name (wildcard, case-insensitive)
+  python services_list.py --filter "sql*"
+
+  # Output as JSON or CSV
+  python services_list.py --format json
+  python services_list.py --format csv > services.csv
+"""
+
+import argparse
+import csv
+import fnmatch
+import json
+import os
+import re
+import subprocess
+import sys
+from typing import List, Dict, Any
+
+Row = Dict[str, Any]
+
+def run(cmd: List[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, shell=False)
+
+def have_powershell() -> bool:
+    # Prefer Windows PowerShell (powershell.exe). pwsh also works on some systems.
+    for exe in ("powershell", "powershell.exe", "pwsh", "pwsh.exe"):
+        try:
+            cp = run([exe, "-NoLogo", "-NoProfile", "-Command", "$PSVersionTable.PSVersion.Major"])
+            if cp.returncode == 0 and cp.stdout.strip().isdigit():
+                return True
+        except FileNotFoundError:
+            continue
+    return False
+
+def powershell_exe() -> str:
+    for exe in ("powershell", "powershell.exe", "pwsh", "pwsh.exe"):
+        try:
+            cp = run([exe, "-NoLogo", "-NoProfile", "-Command", "$true"])
+            if cp.returncode == 0:
+                return exe
+        except FileNotFoundError:
+            continue
+    raise FileNotFoundError("PowerShell not found")
+
+def get_services_powershell(computer: str | None) -> List[Row]:
+    exe = powershell_exe()
+    # -ComputerName works in Windows PowerShell; in PowerShell 7 it proxies via CIM.
+    comp_clause = f"-ComputerName '{computer}'" if computer else ""
+    ps = (
+        "Get-Service {comp} | "
+        "Select-Object Name,DisplayName,Status,StartType | "
+        "ConvertTo-Json -Depth 2"
+    ).format(comp=comp_clause)
+    cp = run([exe, "-NoLogo", "-NoProfile", "-Command", ps])
+    if cp.returncode != 0 or not cp.stdout.strip():
+        raise RuntimeError(cp.stderr.strip() or "PowerShell Get-Service failed")
+    data = json.loads(cp.stdout)
+    # When only one object, ConvertTo-Json returns a dict, not a list
+    if isinstance(data, dict):
+        data = [data]
+    rows: List[Row] = []
+    for s in data:
+        rows.append({
+            "Name": s.get("Name", ""),
+            "DisplayName": s.get("DisplayName", ""),
+            "Status": str(s.get("Status", "")),
+            "StartType": str(s.get("StartType", "")),
+        })
+    return rows
+
+# --- sc.exe fallback parsing ---
+
+STATE_MAP = {
+    "1": "STOPPED",
+    "2": "START PENDING",
+    "3": "STOP PENDING",
+    "4": "RUNNING",
+    "5": "CONTINUE PENDING",
+    "6": "PAUSE PENDING",
+    "7": "PAUSED",
+}
+
+def parse_sc_blocks(text: str) -> List[Row]:
+    # sc query state= all returns blocks separated by blank lines
+    blocks = re.split(r"\r?\n\r?\n+", text.strip(), flags=re.I)
+    rows: List[Row] = []
+    for b in blocks:
+        name = None
+        dname = None
+        status = None
+        starttype = ""  # sc query doesn't include start type in this mode
+        for line in b.splitlines():
+            line = line.strip()
+            if line.startswith("SERVICE_NAME:"):
+                name = line.split(":", 1)[1].strip()
+            elif line.startswith("DISPLAY_NAME:"):
+                dname = line.split(":", 1)[1].strip()
+            elif line.startswith("STATE"):
+                # e.g., STATE              : 4  RUNNING
+                m = re.search(r"STATE\s*:\s*(\d)\s+([A-Z ]+)", line)
+                if m:
+                    num, word = m.group(1), m.group(2).strip()
+                    status = STATE_MAP.get(num, word)
+        if name and dname and status:
+            rows.append({"Name": name, "DisplayName": dname, "Status": status, "StartType": starttype})
+    return rows
+
+def get_services_sc(computer: str | None) -> List[Row]:
+    target = f"\\\\{computer}" if computer else ""
+    # Get all services; sc outputs in OEM codepage; relying on 'text=True' generally works.
+    cp = run(["sc", target, "query", "state=", "all"])
+    if cp.returncode != 0 or not cp.stdout.strip():
+        raise RuntimeError(cp.stderr.strip() or "sc query failed")
+    return parse_sc_blocks(cp.stdout)
+
+# --- output helpers ---
+
+def filter_rows(rows: List[Row], pattern: str | None) -> List[Row]:
+    if not pattern:
+        return rows
+    pat = pattern.lower()
+    def match(r: Row) -> bool:
+        return (
+            fnmatch.fnmatch(r["Name"].lower(), pat) or
+            fnmatch.fnmatch(r["DisplayName"].lower(), pat)
+        )
+    return [r for r in rows if match(r)]
+
+def print_table(rows: List[Row]) -> None:
+    if not rows:
+        print("No services found.")
+        return
+    headers = ["Name", "DisplayName", "Status", "StartType"]
+    widths = {h: max(len(h), max(len(str(r.get(h, ""))) for r in rows)) for h in headers}
+    # Header
+    line = "  ".join(f"{h:<{widths[h]}}" for h in headers)
+    print(line)
+    print("-" * len(line))
+    # Rows
+    for r in rows:
+        print("  ".join(f"{str(r.get(h,'')):<{widths[h]}}" for h in headers))
+
+def print_json(rows: List[Row]) -> None:
+    print(json.dumps(rows, indent=2))
+
+def print_csv(rows: List[Row]) -> None:
+    w = csv.DictWriter(sys.stdout, fieldnames=["Name", "DisplayName", "Status", "StartType"])
+    w.writeheader()
+    for r in rows:
+        w.writerow(r)
+
+def main():
+    ap = argparse.ArgumentParser(description="List Windows services with status.")
+    ap.add_argument("--computer", help="Remote computer name or IP (optional).")
+    ap.add_argument("--filter", help="Wildcard filter on Name/DisplayName, e.g. 'sql*'.")
+    ap.add_argument("--format", choices=["table", "json", "csv"], default="table", help="Output format.")
+    args = ap.parse_args()
+
+    # Ensure we're on Windows if local
+    if os.name != "nt" and not args.computer:
+        print("Warning: This script is intended for Windows. Remote queries may still work.", file=sys.stderr)
+
+    rows: List[Row] = []
+    # Try PowerShell first for richer data
+    try:
+        if have_powershell():
+            rows = get_services_powershell(args.computer)
+        else:
+            raise RuntimeError("PowerShell not available")
+    except Exception:
+        # Fallback to sc.exe (works well locally and remotely: sc \\\\COMPUTER query state= all)
+        try:
+            rows = get_services_sc(args.computer)
+        except Exception as e2:
+            print(f"Failed to retrieve services: {e2}", file=sys.stderr)
+            sys.exit(2)
+
+    rows = filter_rows(rows, args.filter)
+
+    if args.format == "json":
+        print_json(rows)
+    elif args.format == "csv":
+        print_csv(rows)
+    else:
+        print_table(rows)
+
+if __name__ == "__main__":
+    main()
