@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""
+#  Quick setup notes
+#  Run on Windows with Python 3.8+.
+#  Use an app password (e.g., for Gmail/Office365) and pass it via an environment variable (--smtp-pass-env SMTP_PASS) rather than on the CLI.
+#  For remote computers (--computer SERVER01), you need appropriate permissions and open firewall/RPC. PowerShell remoting is not required; this uses Get-Service -ComputerName or sc \\HOST.
+#  watch_service_email.py — Monitor a Windows service and email on state change.
+#  Examples:
+#   Watch Print Spooler locally, check every 15s, Gmail SMTP (use an app password!)
+#    set SMTP_PASS=your_app_password
+#    python watch_service_email.py --service Spooler ^
+#        --interval 15 ^
+#        --smtp-server smtp.gmail.com --smtp-port 587 ^
+#        --smtp-user you@gmail.com --smtp-pass-env SMTP_PASS ^
+#        --from you@gmail.com --to ops@example.com
+#   Watch a remote host and notify on startup with the current state
+#    python watch_service_email.py --service "SQLSERVERAGENT" --computer SERVER01 --notify-on-start ^
+#        --smtp-server mail.company.com --smtp-port 587 --smtp-user notifier@company.com ^
+#        --smtp-pass-env SMTP_PASS --from notifier@company.com --to you@company.com
+"""
+
+import argparse
+import os
+import smtplib
+import socket
+import subprocess
+import sys
+import time
+from email.message import EmailMessage
+from typing import Optional, List
+
+# ---------- Service status helpers ----------
+
+def _run(cmd: List[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, shell=False)
+
+def _powershell_exe() -> Optional[str]:
+    for exe in ("powershell", "powershell.exe", "pwsh", "pwsh.exe"):
+        try:
+            cp = _run([exe, "-NoLogo", "-NoProfile", "-Command", "$PSVersionTable.PSVersion.Major"])
+            if cp.returncode == 0:
+                return exe
+        except FileNotFoundError:
+            continue
+    return None
+
+def get_status_powershell(service: str, computer: Optional[str]) -> Optional[str]:
+    exe = _powershell_exe()
+    if not exe:
+        return None
+    target = f"-ComputerName '{computer}'" if computer else ""
+    # Returns 'Running', 'Stopped', etc. We force a simple string output.
+    ps = f"(Get-Service -Name '{service}' {target}).Status.ToString()"
+    cp = _run([exe, "-NoLogo", "-NoProfile", "-Command", ps])
+    if cp.returncode != 0:
+        return None
+    out = cp.stdout.strip()
+    return out if out else None
+
+def get_status_sc(service: str, computer: Optional[str]) -> Optional[str]:
+    # sc \\HOST query SERVICE_NAME
+    target = [f"\\\\{computer}"] if computer else []
+    cp = _run(["sc", *target, "query", service])
+    if cp.returncode != 0:
+        return None
+    # Parse line like: "STATE              : 4  RUNNING"
+    for line in cp.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("STATE"):
+            parts = line.split()
+            # Usually ... : <code> <word>
+            if len(parts) >= 4:
+                return parts[3].capitalize()  # RUNNING -> Running
+    return None
+
+def get_service_status(service: str, computer: Optional[str]) -> Optional[str]:
+    """
+    Returns 'Running', 'Stopped', etc., or None if not found/unavailable.
+    """
+    # Prefer PowerShell for accuracy
+    st = get_status_powershell(service, computer)
+    if st:
+        return st
+    # Fallback to sc.exe
+    return get_status_sc(service, computer)
+
+# ---------- Email helper ----------
+
+def send_email(
+    smtp_server: str,
+    smtp_port: int,
+    smtp_user: str,
+    smtp_pass: str,
+    mail_from: str,
+    mail_to: str,
+    subject: str,
+    body: str,
+    starttls: bool = True,
+) -> None:
+    msg = EmailMessage()
+    msg["From"] = mail_from
+    msg["To"] = mail_to
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    with smtplib.SMTP(smtp_server, smtp_port, timeout=30) as s:
+        s.ehlo()
+        if starttls:
+            s.starttls()
+            s.ehlo()
+        if smtp_user or smtp_pass:
+            s.login(smtp_user, smtp_pass)
+        s.send_message(msg)
+
+# ---------- Main loop ----------
+
+def main():
+    ap = argparse.ArgumentParser(description="Watch a Windows service and email on state change.")
+    ap.add_argument("--service", required=True, help="Service name (e.g., 'Spooler' or 'SQLSERVERAGENT').")
+    ap.add_argument("--computer", help="Remote computer name or IP (optional).")
+    ap.add_argument("--interval", type=int, default=15, help="Seconds between checks (default: 15).")
+    ap.add_argument("--notify-on-start", action="store_true",
+                    help="Send an email immediately with the current state on startup.")
+    # SMTP / email
+    ap.add_argument("--smtp-server", required=True, help="SMTP server (e.g., smtp.gmail.com).")
+    ap.add_argument("--smtp-port", type=int, default=587, help="SMTP port (default: 587).")
+    ap.add_argument("--smtp-user", default="", help="SMTP username (email address in many cases).")
+    ap.add_argument("--smtp-pass", default="", help="SMTP password (NOT recommended to pass inline).")
+    ap.add_argument("--smtp-pass-env", help="Env var name containing the SMTP password (preferred).")
+    ap.add_argument("--no-starttls", action="store_true", help="Disable STARTTLS (not recommended).")
+    ap.add_argument("--from", dest="mail_from", required=True, help="From email address.")
+    ap.add_argument("--to", dest="mail_to", required=True, help="To email address.")
+    ap.add_argument("--subject-prefix", default="[ServiceWatch]",
+                    help="Subject prefix for emails.")
+    args = ap.parse_args()
+
+    if os.name != "nt" and not args.computer:
+        print("Warning: This script targets Windows. Remote queries may still work.", file=sys.stderr)
+
+    smtp_pass = args.smtp_pass or (os.environ.get(args.smtp_pass_env) if args.smtp_pass_env else "")
+    if not smtp_pass:
+        print("Note: SMTP password not provided. If your server allows anonymous relay, this is fine; "
+              "otherwise pass --smtp-pass or --smtp-pass-env.", file=sys.stderr)
+
+    host_label = args.computer or socket.gethostname()
+    last_state: Optional[str] = None
+
+    # Initial probe
+    state = get_service_status(args.service, args.computer)
+    if state is None:
+        print(f"ERROR: Could not retrieve status for service '{args.service}' on '{host_label}'.", file=sys.stderr)
+        sys.exit(2)
+
+    if args.notify_on_start:
+        subj = f"{args.subject_prefix} {args.service} on {host_label}: initial state {state}"
+        body = (f"Service: {args.service}\n"
+                f"Host:    {host_label}\n"
+                f"State:   {state}\n"
+                f"Time:    {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        try:
+            send_email(args.smtp_server, args.smtp_port, args.smtp_user, smtp_pass,
+                       args.mail_from, args.mail_to, subj, body, starttls=not args.no_starttls)
+            print(f"Sent startup notification: {subj}")
+        except Exception as e:
+            print(f"Failed to send startup email: {e}", file=sys.stderr)
+
+    last_state = state
+    print(f"Watching '{args.service}' on '{host_label}' every {args.interval}s. Current state: {state}")
+
+    try:
+        while True:
+            time.sleep(args.interval)
+            state = get_service_status(args.service, args.computer)
+            if state is None:
+                # Transient failure; keep previous state and continue
+                print("Warning: Unable to read service status (network/permission?). Retrying...", file=sys.stderr)
+                continue
+
+            if state != last_state:
+                subj = f"{args.subject_prefix} {args.service} on {host_label}: {last_state} -> {state}"
+                body = (f"Service: {args.service}\n"
+                        f"Host:    {host_label}\n"
+                        f"Previous state: {last_state}\n"
+                        f"Current state:  {state}\n"
+                        f"Time:           {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                try:
+                    send_email(args.smtp_server, args.smtp_port, args.smtp_user, smtp_pass,
+                               args.mail_from, args.mail_to, subj, body, starttls=not args.no_starttls)
+                    print(f"Notification sent: {subj}")
+                except Exception as e:
+                    print(f"Failed to send email: {e}", file=sys.stderr)
+                last_state = state
+    except KeyboardInterrupt:
+        print("\nStopping watcher.")
+
+if __name__ == "__main__":
+    main()
