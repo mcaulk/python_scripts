@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""
+find_hosts.py — Locate Windows 'hosts' files.
+
+Usage examples:
+  # Fast: check the standard locations only
+  python find_hosts.py
+
+  # Deep scan all fixed drives, stop at first match
+  python find_hosts.py --search-all --first
+
+  # Deep scan starting from specific paths
+  python find_hosts.py --start C:\ C:\Users --max-depth 6
+
+  # Include network and removable drives
+  python find_hosts.py --search-all --include-network --include-removable
+"""
+
+import os
+import sys
+import argparse
+from pathlib import Path
+
+def is_windows() -> bool:
+    return os.name == "nt"
+
+def common_hosts_candidates() -> list[Path]:
+    """Return common Windows locations for the hosts file."""
+    candidates: list[Path] = []
+    for env in ("SystemRoot", "WINDIR"):
+        root = os.environ.get(env)
+        if root:
+            root_path = Path(root)
+            # Normal path
+            candidates.append(root_path / "System32" / "drivers" / "etc" / "hosts")
+            # Sysnative helps 32-bit Python on 64-bit Windows reach 64-bit System32
+            candidates.append(root_path / "Sysnative" / "drivers" / "etc" / "hosts")
+    # Fallback hard-coded path
+    candidates.append(Path(r"C:\Windows\System32\drivers\etc\hosts"))
+    # Deduplicate while preserving order
+    seen = set()
+    uniq = []
+    for p in candidates:
+        pnorm = str(p.resolve().as_posix()).lower() if p.exists() else str(p).lower()
+        if pnorm not in seen:
+            seen.add(pnorm)
+            uniq.append(p)
+    return uniq
+
+def iter_drives(include_network: bool, include_removable: bool):
+    """Yield Path objects for selected drive roots on Windows."""
+    import string
+    import ctypes
+
+    DRIVE_UNKNOWN = 0
+    DRIVE_NO_ROOT_DIR = 1
+    DRIVE_REMOVABLE = 2
+    DRIVE_FIXED = 3
+    DRIVE_REMOTE = 4
+    DRIVE_CDROM = 5
+    DRIVE_RAMDISK = 6
+
+    kernel32 = ctypes.windll.kernel32
+    bitmask = kernel32.GetLogicalDrives()
+    for i, letter in enumerate(string.ascii_uppercase):
+        if bitmask & (1 << i):
+            root = f"{letter}:/"
+            dtype = kernel32.GetDriveTypeW(f"{letter}:/")
+            if (
+                dtype == DRIVE_FIXED
+                or (include_network and dtype == DRIVE_REMOTE)
+                or (include_removable and dtype == DRIVE_REMOVABLE)
+            ):
+                yield Path(root)
+
+def safe_walk(start: Path, max_depth: int | None):
+    """os.walk with permission error handling and optional depth limiting."""
+    target_depth = None
+    try:
+        target_depth = len(start.resolve().parts)
+    except Exception:
+        target_depth = len(start.parts)
+
+    for root, dirs, files in os.walk(start, topdown=True, onerror=lambda e: None, followlinks=False):
+        # Depth limiting
+        if max_depth is not None:
+            try:
+                current_depth = len(Path(root).resolve().parts)
+            except Exception:
+                current_depth = len(Path(root).parts)
+            if current_depth - target_depth >= max_depth:
+                dirs[:] = []  # don't descend further
+        yield root, dirs, files
+
+def find_named_hosts(start_paths: list[Path], max_depth: int | None, first: bool):
+    """Search for files named exactly 'hosts' (no extension) under start_paths."""
+    results: list[Path] = []
+    for start in start_paths:
+        if not start.exists():
+            continue
+        for root, _, files in safe_walk(start, max_depth):
+            # Exact filename 'hosts' only (case-insensitive), no extension
+            for name in files:
+                if name.lower() == "hosts":
+                    p = Path(root) / name
+                    results.append(p)
+                    if first:
+                        return results
+    return results
+
+def describe(p: Path) -> str:
+    try:
+        stat = p.stat()
+        size = stat.st_size
+        mtime = stat.st_mtime
+        from datetime import datetime
+        ts = datetime.fromtimestamp(mtime)
+        return f"{p}  (size={size} bytes, modified={ts})"
+    except Exception:
+        return str(p)
+
+def main():
+    if not is_windows():
+        print("This script is intended for Windows (os.name == 'nt').", file=sys.stderr)
+        # Still proceed; paths may not exist on non-Windows
+    ap = argparse.ArgumentParser(description="Find Windows 'hosts' files.")
+    ap.add_argument("--search-all", action="store_true",
+                    help="Search all selected drives (fixed by default).")
+    ap.add_argument("--include-network", action="store_true",
+                    help="Include network drives in search (requires --search-all).")
+    ap.add_argument("--include-removable", action="store_true",
+                    help="Include removable drives in search (requires --search-all).")
+    ap.add_argument("--start", nargs="*", type=Path, default=[],
+                    help="Starting path(s) to search. If omitted, uses drive roots or common locations.")
+    ap.add_argument("--max-depth", type=int, default=None,
+                    help="Limit recursion depth from each start path (0 = only the start dir).")
+    ap.add_argument("--first", action="store_true",
+                    help="Stop after the first match.")
+    args = ap.parse_args()
+
+    found: list[Path] = []
+
+    # 1) Quick check: common locations
+    for p in common_hosts_candidates():
+        if p.exists():
+            found.append(p)
+            if args.first:
+                print(describe(p))
+                return
+
+    # 2) If user requested search or nothing found yet, scan
+    start_points: list[Path] = []
+
+    if args.start:
+        start_points = [Path(s) for s in args.start]
+    elif args.search_all:
+        # Enumerate drives
+        start_points = list(iter_drives(args.include_network, args.include_removable))
+    else:
+        # If we already found something in common locations, just print and exit.
+        if found:
+            for p in found:
+                print(describe(p))
+            return
+        # Otherwise, default to scanning the system drive root if available
+        system_drive = os.environ.get("SystemDrive", "C:")
+        start_points = [Path(system_drive + "\\")]
+
+    # Run the scan
+    matches = find_named_hosts(start_points, args.max_depth, args.first)
+    found.extend(matches)
+
+    if not found:
+        print("No files named 'hosts' were found.")
+        return
+
+    # Deduplicate results and print
+    seen = set()
+    for p in found:
+        try:
+            key = str(p.resolve()).lower()
+        except Exception:
+            key = str(p).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        print(describe(p))
+
+if __name__ == "__main__":
+    main()
